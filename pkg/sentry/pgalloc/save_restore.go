@@ -120,7 +120,7 @@ func (f *MemoryFile) exportMetadataProto() *pgallocpb.MemoryFileMetadataProto {
 }
 
 func (f *MemoryFile) importMetadataProto(pb *pgallocpb.MemoryFileMetadataProto) error {
-	if pb.Version != 1 {
+	if pb.Version != 1 && pb.Version != 2 {
 		return fmt.Errorf("unsupported MemoryFileMetadataProto version %d", pb.Version)
 	}
 	f.subreleased = make(map[uint64]uint64, len(pb.Subreleased))
@@ -185,6 +185,15 @@ type SaveOpts struct {
 	// the host in place rather than decommit them.
 	ExitAfterSaving bool
 }
+
+// subpageSize is the size of the blocks in which SaveTo() saves the pages of a
+// disk-backed MemoryFile to a pages file. SaveTo() does not save blocks that
+// contain only zero bytes. When pages are large, most of such a MemoryFile is
+// zero bytes, because each small file occupies a page of its own.
+//
+// subpageSize has no effect unless it is less than hostarch.PageSize. Only
+// tests mutate subpageSize.
+var subpageSize uint64 = 4096
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
@@ -384,6 +393,45 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// usage.
 	decommitZeroPages := !opts.ExitAfterSaving || dataSeeker == nil
 	zeroPage := make([]byte, hostarch.PageSize)
+	// See subpageSize.
+	var (
+		savedRanges []*pgallocpb.FileRangeProto
+		savedBytes  uint64
+		zeroBlock   memmap.FileRange
+	)
+	subpages := amfs != nil && f.opts.DiskBackedFile && subpageSize < hostarch.PageSize
+	writeBlocks := asyncWritePages
+	if subpages {
+		asyncWritePages = func(fr memmap.FileRange) {
+			var run memmap.FileRange
+			writeRun := func() {
+				if run.Length() != 0 {
+					writeBlocks(run)
+					savedRanges = append(savedRanges, &pgallocpb.FileRangeProto{Start: run.Start, End: run.End})
+					savedBytes += run.Length()
+				}
+			}
+			f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+				bs := chunk.sliceAt(chunkFR)
+				for i := uint64(0); i < uint64(len(bs)); i += subpageSize {
+					block := memmap.FileRange{chunkFR.Start + i, chunkFR.Start + i + subpageSize}
+					switch {
+					case bytes.Equal(bs[i:i+subpageSize], zeroPage[:subpageSize]):
+						// Zero blocks are saved implicitly.
+						queuedPageBytes += subpageSize
+						zeroBlock = block
+					case run.End == block.Start:
+						run.End = block.End
+					default:
+						writeRun()
+						run = block
+					}
+				}
+				return true
+			})
+			writeRun()
+		}
+	}
 	// f.mu is unlocked below, allowing concurrent calls to f.UpdateUsage() to
 	// observe pages that we transiently commit (for comparisons to zero) or
 	// leave committed (if opts.ExcludeCommittedZeroPages is true). Set
@@ -533,6 +581,15 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		return fmt.Errorf("async page save queued %d bytes, but metadata describes %d bytes", queuedPageBytes, f.knownCommittedBytes)
 	}
 	pb := f.exportMetadataProto()
+	if subpages {
+		// Pad the saved blocks to a page boundary, so that the pages of the
+		// next MemoryFile are page-aligned in the pages file.
+		for ; savedBytes%hostarch.PageSize != 0; savedBytes += subpageSize {
+			writeBlocks(zeroBlock)
+		}
+		pb.Version = 2
+		pb.SavedRanges = savedRanges
+	}
 	data, err := proto.Marshal(pb)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
@@ -835,7 +892,7 @@ func (apfs *AsyncPagesFileSave) enqueueCurOp() {
 // Preconditions:
 // - apfs.canEnqueue() == true.
 // - mfr.Length() > 0.
-// - mfr must be page-aligned.
+// - mfr must be aligned to subpageSize.
 func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 	for {
 		if apfs.curOp == nil {
@@ -868,7 +925,7 @@ func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 //
 // Preconditions:
 // - mfr.Length() > 0.
-// - mfr must be page-aligned.
+// - mfr must be aligned to subpageSize.
 func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 	op := apfs.curOp
 	if op.total != 0 {
@@ -1269,6 +1326,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	wr := wire.Reader{Reader: r}
 	timePagesStart := gohacks.Nanotime()
 	minUnloadedInit := false
+	savedRanges := pb.SavedRanges
 	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
 		if !maseg.ValuePtr().knownCommitted {
 			continue
@@ -1286,11 +1344,23 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				amfl.minUnloaded.Store(maFR.Start)
 			}
 			amfl.pf.mu.Lock()
-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: opts.PagesFileOffset,
-			})
+			if pb.Version == 1 {
+				amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
+					off: opts.PagesFileOffset,
+				})
+				opts.PagesFileOffset += amount
+			}
+			for ; len(savedRanges) != 0; savedRanges = savedRanges[1:] {
+				fr := memmap.FileRange{savedRanges[0].Start, savedRanges[0].End}
+				if !maFR.IsSupersetOf(fr) {
+					break
+				}
+				amfl.unloaded.InsertRange(fr, aplUnloadedInfo{
+					off: opts.PagesFileOffset,
+				})
+				opts.PagesFileOffset += fr.Length()
+			}
 			amfl.pf.mu.Unlock()
-			opts.PagesFileOffset += amount
 			amfl.pf.lfStatus.Notify(aplLFPending)
 		} else {
 			// Verify header.
@@ -1327,6 +1397,11 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			usage.MemoryAccounting.Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
 		}
 	}
+	if len(savedRanges) != 0 {
+		return fmt.Errorf("saved range [%#x, %#x) is not in known-committed pages", savedRanges[0].Start, savedRanges[0].End)
+	}
+	// Skip the padding that follows saved ranges.
+	opts.PagesFileOffset = hostarch.MustPageRoundUp(opts.PagesFileOffset)
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
 	if amfl != nil {
 		log.Infof("MemoryFile(%p): loaded page file offsets in %s; async loading %d bytes", f, durPages, f.knownCommittedBytes)
@@ -1454,8 +1529,9 @@ type asyncMemoryFileLoad struct {
 	// minUnloaded is the MemoryFile offset of the first unloaded byte.
 	minUnloaded atomicbitops.Uint64
 
-	// unloaded tracks pages in the MemoryFile that have not been loaded.
-	// unloaded is protected by pf.mu.
+	// unloaded tracks ranges of the MemoryFile that have not been loaded.
+	// Segments are aligned to subpageSize. Segments that are not started
+	// only adjoin at page boundaries. unloaded is protected by pf.mu.
 	unloaded aplUnloadedSet
 
 	// lfDone is true if MemoryFile.LoadFrom() has finished inserting into
@@ -1536,6 +1612,11 @@ type aplOp struct {
 
 func (op *aplOp) off() int64 {
 	return int64(op.end - op.total)
+}
+
+// pageRange returns the pages that contain fr.
+func pageRange(fr memmap.FileRange) memmap.FileRange {
+	return memmap.FileRange{hostarch.PageRoundDown(fr.Start), hostarch.MustPageRoundUp(fr.End)}
 }
 
 // AsyncPagesFileLoadOpts contains options to StartAsyncPagesFileLoad.
@@ -1622,8 +1703,8 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		return nil
 	}
 
-	// fr might not be page-aligned; everything else involved in async page
-	// loading requires page-aligned FileRanges.
+	// fr might not be page-aligned; amfl.unloaded must only be split at page
+	// boundaries here.
 	fr.Start = hostarch.PageRoundDown(fr.Start)
 	fr.End = hostarch.MustPageRoundUp(fr.End)
 
@@ -1717,7 +1798,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 // Preconditions:
 // - apfl.canEnqueue() == true.
 // - fr.Length() > 0.
-// - fr must be page-aligned.
+// - fr must be aligned to subpageSize.
 func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
 	for {
 		if apfl.curOp == nil {
@@ -1750,7 +1831,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 //
 // Preconditions:
 // - fr.Length() > 0.
-// - fr must be page-aligned.
+// - fr must be aligned to subpageSize.
 func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
 	op := apfl.curOp
 	if op.total != 0 {
@@ -1838,7 +1919,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 	collectRefs := func(op *aplOp) {
 		if op.tempRef {
 			for _, fr := range op.frs {
-				decRefs = append(decRefs, aplFileRange{op.amfl, fr})
+				// References are held on whole pages. Ranges that combine()
+				// merged adjoin at page boundaries, so each page gets back
+				// the references that were taken when its ranges started.
+				decRefs = append(decRefs, aplFileRange{op.amfl, pageRange(fr)})
 			}
 		}
 	}
@@ -2045,7 +2129,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 					ulseg.ValuePtr().started = true
 					amfl.minUnstarted = ulFR.End
-					amfl.f.incRefLocked(ulFR)
+					amfl.f.incRefLocked(pageRange(ulFR))
 					if (throttled && partial) || !apfl.canEnqueue() {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()

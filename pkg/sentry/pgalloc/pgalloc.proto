@@ -48,4 +48,9 @@ message MemoryFileMetadataProto {
   repeated FileRangeProto unwaste_small = 6;
   repeated FileRangeProto unwaste_huge = 7;
   map<uint64, uint64> subreleased = 8;
+
+  // In version 2, the pages file contains only these ranges of the MemoryFile,
+  // in this order, followed by padding to a page boundary. All other bytes in
+  // known-committed pages are zero.
+  repeated FileRangeProto saved_ranges = 9;
 }
